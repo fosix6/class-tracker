@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Class Tracker</title>
+<link rel="manifest" href="manifest.json" />
+<meta name="theme-color" content="#2c2c2a" />
+<link rel="apple-touch-icon" href="icons/icon-192.png" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<div id="app"></div>
+
+<!-- Roster editor modal (one template: attendance names per weekday + optional piket names per weekday) -->
+<dialog id="templateDialog">
+  <form method="dialog" id="templateForm">
+    <h2 id="templateDialogTitle">New class roster</h2>
+    <label>
+      Roster name
+      <input type="text" id="templateNameInput" required placeholder="e.g. Class 5B" />
+    </label>
+
+    <h3>Students (attendance list)</h3>
+    <label>
+      One name per line — this is the full class roster used for daily attendance
+      <textarea id="rosterNamesInput" rows="8" placeholder="Alice&#10;Bob&#10;Charlie"></textarea>
+    </label>
+
+    <h3>Piket (cleaning duty) — names per weekday</h3>
+    <div id="dayInputsContainer"></div>
+
+    <div class="dialog-actions">
+      <button type="button" id="templateCancelBtn">Cancel</button>
+      <button type="submit" id="templateSaveBtn">Save roster</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Instantiate day modal -->
+<dialog id="instantiateDialog">
+  <form method="dialog" id="instantiateForm">
+    <h2>New day</h2>
+    <label>
+      Date
+      <input type="date" id="instanceDateInput" required />
+    </label>
+    <label>
+      From roster
+      <select id="instanceTemplateSelect"></select>
+    </label>
+    <div class="dialog-actions">
+      <button type="button" id="instantiateCancelBtn">Cancel</button>
+      <button type="submit">Create day</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Proof of work modal -->
+<dialog id="proofDialog">
+  <form method="dialog" id="proofForm">
+    <h2>Proof of work</h2>
+    <label>
+      Notes
+      <textarea id="proofNoteInput" rows="4" placeholder="What was done today..."></textarea>
+    </label>
+    <label>
+      Photos
+      <input type="file" id="proofPhotoInput" accept="image/*" multiple />
+    </label>
+    <div id="proofPhotoPreview" class="photo-preview"></div>
+    <div class="dialog-actions">
+      <button type="button" id="proofCancelBtn">Cancel</button>
+      <button type="submit">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>
