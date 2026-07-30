@@ -23,6 +23,7 @@ function loadData() {
 function saveData() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    scheduleBackup();
   } catch (e) {
     alert("Could not save — storage may be full (large photos take space). Try removing some photos.");
   }
@@ -34,6 +35,12 @@ function uid() {
 
 let state = loadData();
 let view = { screen: "home", instanceId: null, templateId: null, personName: null, tab: "attendance" };
+
+let backupDebounceTimer = null;
+function scheduleBackup() {
+  clearTimeout(backupDebounceTimer);
+  backupDebounceTimer = setTimeout(writeBackupNow, 3000);
+}
 
 const app = document.getElementById("app");
 
@@ -536,15 +543,17 @@ function renderAnalysis(templateId) {
       <div class="card-title">Graph</div>
       <div class="card-sub">Pick a student and see their attendance/piket breakdown</div>
     </div>
-    <div class="card" data-action="export-csv">
-      <div class="card-title">Export CSV</div>
-      <div class="card-sub">Download attendance and piket task logs as CSV files</div>
+    <button class="icon" id="chooseBackupFolderBtn">Pilih folder backup</button>
+    <div class="card" data-action="export-zip">
+      <div class="card-title">Ekspor ZIP</div>
+      <div class="card-sub">Attendance, cleanup tasks, dan proof of work per hari</div>
     </div>
   `;
   document.getElementById("backBtn").onclick = () => { view = { screen: "home" }; render(); };
+  document.getElementById("chooseBackupFolderBtn").onclick = chooseBackupFolder;
   app.querySelector('[data-action="open-tally"]').onclick = () => { view = { screen: "tally", templateId }; render(); };
   app.querySelector('[data-action="open-graph"]').onclick = () => { view = { screen: "graph", templateId }; render(); };
-  app.querySelector('[data-action="export-csv"]').onclick = () => exportCsvForTemplate(templateId);
+  app.querySelector('[data-action="export-zip"]').onclick = () => exportZipForTemplate(templateId);
 }
 
 function getInstancesForTemplate(templateId) {
@@ -748,3 +757,173 @@ if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("sw.js").catch(() => {});
   });
 }
+// ---------- ZIP EXPORT (per-day attendance + cleanup CSVs, proof photos/notes) ----------
+
+function reasonCode(status) {
+  // Map your status values to single-letter codes: Sick / Izin(permission) / Alpha
+  if (status === "sick") return "S";
+  if (status === "permission") return "I";
+  if (status === "alpha") return "A";
+  return ""; // present / no status
+}
+
+function csvEscape(val) {
+  const s = val == null ? "" : String(val);
+  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+function rowsToCsv(rows) {
+  return rows.map(row => row.map(csvEscape).join(",")).join("\r\n");
+}
+function sanitizeFilename(name) {
+  return String(name).replace(/[^a-z0-9_\-]+/gi, "_");
+}
+
+async function exportZipForTemplate(templateId) {
+  const template = state.templates.find(t => t.id === templateId);
+  if (!template) return;
+  const instances = getInstancesForTemplate(templateId)
+    .slice()
+    .sort((a, b) => a.date.localeCompare(b.date));
+
+  if (!instances.length) {
+    alert("Tidak ada data untuk diekspor.");
+    return;
+  }
+
+  const zip = new JSZip();
+  const root = zip.folder(sanitizeFilename(template.name));
+
+  for (const inst of instances) {
+    const dayFolder = root.folder(inst.date); // e.g. 2026-07-30
+
+    // 1. Attendance CSV: Name, Reason
+    const attRows = [["Name", "Reason"]];
+    inst.attendance.forEach(a => {
+      attRows.push([a.name, reasonCode(a.status)]);
+    });
+    dayFolder.file("attendance.csv", rowsToCsv(attRows));
+
+    // 2. Class cleanup CSV: student, assigned tasks, completed?
+    // Group tasks by assignee so each student gets one row listing all their tasks.
+    const byStudent = {};
+    inst.tasks.forEach(t => {
+      const name = t.assignedName || "(unassigned)";
+      if (!byStudent[name]) byStudent[name] = [];
+      byStudent[name].push(t);
+    });
+    const cleanupRows = [["Name", "Task", "Completed", "Excused"]];
+    Object.entries(byStudent).forEach(([name, tasks]) => {
+      tasks.forEach(t => {
+        cleanupRows.push([
+          name,
+          t.label,
+          t.done ? "Yes" : "No",
+          t.excused ? "Yes" : "No"
+        ]);
+      });
+    });
+    dayFolder.file("class_cleanup.csv", rowsToCsv(cleanupRows));
+
+    // 3. Proof of work: text note + photos folder
+    if (inst.proof) {
+      if (inst.proof.note) {
+        dayFolder.file("proof_notes.txt", inst.proof.note);
+      }
+      if (inst.proof.photos && inst.proof.photos.length) {
+        const photosFolder = dayFolder.folder("proof_photos");
+        inst.proof.photos.forEach((dataUrl, idx) => {
+          const base64 = dataUrl.split(",")[1];
+          if (base64) {
+            photosFolder.file(`photo_${String(idx + 1).padStart(2, "0")}.jpg`, base64, { base64: true });
+          }
+        });
+      }
+    }
+  }
+
+  const blob = await zip.generateAsync({ type: "blob" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${sanitizeFilename(template.name)}_export_${todayISO()}.zip`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// ---------- FILESYSTEM BACKUP (File System Access API) ----------
+
+let backupDirHandle = null; // persists only for the session unless you store the handle via IndexedDB
+
+async function chooseBackupFolder() {
+  if (!("showDirectoryPicker" in window)) {
+    alert("Fitur ini tidak didukung di browser ini. Gunakan Chrome/Edge di desktop atau Android.");
+    return;
+  }
+  try {
+    backupDirHandle = await window.showDirectoryPicker();
+    await idbSaveHandle(backupDirHandle);
+    alert("Folder backup dipilih. Backup akan disimpan di sini secara berkala.");
+  } catch (e) {
+    // user cancelled
+  }
+}
+
+async function writeBackupNow() {
+  if (!backupDirHandle) return;
+  try {
+    // verify/re-request permission (required after reload)
+    const perm = await backupDirHandle.requestPermission({ mode: "readwrite" });
+    if (perm !== "granted") return;
+
+    const fileHandle = await backupDirHandle.getFileHandle(
+      `class-tracker-backup-${todayISO()}.json`,
+      { create: true }
+    );
+    const writable = await fileHandle.createWritable();
+    await writable.write(JSON.stringify(state, null, 2));
+    await writable.close();
+    console.log("Backup written", new Date().toISOString());
+  } catch (e) {
+    console.error("Backup failed", e);
+  }
+}
+
+// Persist the directory handle across reloads using IndexedDB (handles aren't localStorage-serializable)
+function idbSaveHandle(handle) {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open("class-tracker-fs", 1);
+    req.onupgradeneeded = () => req.result.createObjectStore("handles");
+    req.onsuccess = () => {
+      const tx = req.result.transaction("handles", "readwrite");
+      tx.objectStore("handles").put(handle, "backupDir");
+      tx.oncomplete = resolve;
+      tx.onerror = reject;
+    };
+    req.onerror = reject;
+  });
+}
+
+function idbLoadHandle() {
+  return new Promise((resolve) => {
+    const req = indexedDB.open("class-tracker-fs", 1);
+    req.onupgradeneeded = () => req.result.createObjectStore("handles");
+    req.onsuccess = () => {
+      const tx = req.result.transaction("handles", "readonly");
+      const getReq = tx.objectStore("handles").get("backupDir");
+      getReq.onsuccess = () => resolve(getReq.result || null);
+      getReq.onerror = () => resolve(null);
+    };
+    req.onerror = () => resolve(null);
+  });
+}
+
+// On load: try to restore the saved folder handle and back up every 5 minutes + on save
+(async () => {
+  backupDirHandle = await idbLoadHandle();
+  if (backupDirHandle) {
+    setInterval(writeBackupNow, 5 * 60 * 1000);
+  }
+})();
