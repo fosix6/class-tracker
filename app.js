@@ -1,929 +1,888 @@
-const STORAGE_KEY = "class-tracker-data-v1";
-const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+(function() {
+  // ----- constants & state -----
+  const STORAGE_KEY = 'tardiness-tracker-v1';
+  const SYNC_KEY_PREFIX = 'tardiness-sync-';
 
-function taskSlotsForDay(dayName) {
-  const sweepCount = dayName === "Monday" ? 4 : 3;
-  const slots = [];
-  for (let i = 0; i < sweepCount; i++) slots.push({ type: "sweep", label: "Sweep floors" });
-  for (let i = 0; i < 2; i++) slots.push({ type: "trash", label: "Clean trash" });
-  for (let i = 0; i < 2; i++) slots.push({ type: "mop", label: "Mop" });
-  return slots;
-}
+  let state = loadState();
+  let view = { screen: 'home', sublistId: null, showModal: false };
+  let modalState = { jurusan: '', kelas: '', filter: '', selectedStudent: null };
+  let students = [];
+  let uniqueJurusan = [];
+  let uniqueKelas = [];
+  let deferredPrompt = null;
+  let gun = null;
+  let syncEnabled = false;
+  let deviceId = '';
+  let roomCode = localStorage.getItem('room-code') || '';
+  let isSyncing = false;
 
-function loadData() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { templates: [], instances: [] };
-    return JSON.parse(raw);
-  } catch (e) {
-    return { templates: [], instances: [] };
-  }
-}
-
-function saveData() {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-    scheduleBackup();
-  } catch (e) {
-    alert("Could not save — storage may be full (large photos take space). Try removing some photos.");
-  }
-}
-
-function uid() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-}
-
-let state = loadData();
-let view = { screen: "home", instanceId: null, templateId: null, personName: null, tab: "attendance" };
-
-let backupDebounceTimer = null;
-function scheduleBackup() {
-  clearTimeout(backupDebounceTimer);
-  backupDebounceTimer = setTimeout(writeBackupNow, 3000);
-}
-
-const app = document.getElementById("app");
-
-function render() {
-  if (view.screen === "instance" && view.instanceId) {
-    renderInstanceDetail(view.instanceId);
-  } else if (view.screen === "analysis" && view.templateId) {
-    renderAnalysis(view.templateId);
-  } else if (view.screen === "tally" && view.templateId) {
-    renderTally(view.templateId);
-  } else if (view.screen === "graph" && view.templateId) {
-    renderGraph(view.templateId);
-  } else {
-    renderHome();
-  }
-}
-
-function todayISO() {
-  const d = new Date();
-  const tz = d.getTimezoneOffset() * 60000;
-  return new Date(d - tz).toISOString().slice(0, 10);
-}
-
-function formatDate(iso) {
-  if (!iso) return "Untitled";
-  const [y, m, d] = iso.split("-").map(Number);
-  const date = new Date(y, m - 1, d);
-  return date.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
-}
-
-function weekdayNameFromISO(iso) {
-  const [y, m, d] = iso.split("-").map(Number);
-  const date = new Date(y, m - 1, d);
-  const jsDay = date.getDay();
-  if (jsDay === 0) return null;
-  return DAYS[jsDay - 1];
-}
-
-// ---------- HOME ----------
-function renderHome() {
-  const templatesHtml = state.templates.length
-    ? state.templates.map(t => `
-      <div class="card">
-        <div class="card-title-row">
-          <div>
-            <div class="card-title">${escapeHtml(t.name)}</div>
-            <div class="card-sub">${t.students.length} students · ${DAYS.filter(d => (t.days[d] || []).length).length} piket days assigned</div>
-          </div>
-          <div class="row">
-            <button class="icon" data-action="analysis" data-id="${t.id}">Analysis</button>
-            <button class="icon" data-action="edit-template" data-id="${t.id}">Edit</button>
-            <button class="icon danger" data-action="delete-template" data-id="${t.id}">Delete</button>
-          </div>
-        </div>
-      </div>
-    `).join("")
-    : `<div class="empty-state">No rosters yet. Create one to get started.</div>`;
-
-  const instancesHtml = state.instances.length
-    ? state.instances.slice().sort((a, b) => b.date.localeCompare(a.date)).map(inst => {
-        const totalTasks = inst.tasks.length;
-        const doneTasks = inst.tasks.filter(t => t.done || t.excused).length;
-        const absentCount = inst.attendance.filter(a => a.status).length;
-        const hasProof = inst.proof && (inst.proof.note || (inst.proof.photos && inst.proof.photos.length));
-        return `
-      <div class="card" data-action="open-instance" data-id="${inst.id}">
-        <div class="card-title-row">
-          <div>
-            <div class="card-title">${formatDate(inst.date)} <span class="card-sub">(${inst.weekday})</span></div>
-            <div class="card-sub">${absentCount} absent · ${doneTasks}/${totalTasks} tasks resolved${hasProof ? " · proof attached" : ""}</div>
-          </div>
-          <button class="icon danger" data-action="delete-instance" data-id="${inst.id}">Delete</button>
-        </div>
-      </div>`;
-      }).join("")
-    : `<div class="empty-state">No days yet. Create one from a roster below.</div>`;
-
-  app.innerHTML = `
-    <header>
-      <h1>Class Tracker</h1>
-    </header>
-
-    <section>
-      <div class="card-title-row" style="margin-bottom:0.75rem;">
-        <h2>Days</h2>
-        <button class="primary" id="newInstanceBtn" ${state.templates.length === 0 ? "disabled" : ""}>+ New day</button>
-      </div>
-      ${instancesHtml}
-    </section>
-
-    <section>
-      <div class="card-title-row" style="margin-bottom:0.75rem;">
-        <h2>Class rosters</h2>
-        <button id="newTemplateBtn">+ New roster</button>
-      </div>
-      ${templatesHtml}
-    </section>
-  `;
-
-  document.getElementById("newTemplateBtn").onclick = () => openTemplateDialog();
-  document.getElementById("newInstanceBtn").onclick = () => openInstantiateDialog();
-
-  app.querySelectorAll('[data-action="analysis"]').forEach(btn =>
-    btn.onclick = (e) => { e.stopPropagation(); view = { screen: "analysis", templateId: btn.dataset.id }; render(); });
-  app.querySelectorAll('[data-action="edit-template"]').forEach(btn =>
-    btn.onclick = (e) => { e.stopPropagation(); openTemplateDialog(btn.dataset.id); });
-  app.querySelectorAll('[data-action="delete-template"]').forEach(btn =>
-    btn.onclick = (e) => { e.stopPropagation(); deleteTemplate(btn.dataset.id); });
-  app.querySelectorAll('[data-action="delete-instance"]').forEach(btn =>
-    btn.onclick = (e) => { e.stopPropagation(); deleteInstance(btn.dataset.id); });
-  app.querySelectorAll('[data-action="open-instance"]').forEach(card =>
-    card.onclick = () => { view = { screen: "instance", instanceId: card.dataset.id, tab: "attendance" }; render(); });
-}
-
-function deleteInstance(id) {
-  if (!confirm("Delete this day? Attendance and proof of work will be lost.")) return;
-  state.instances = state.instances.filter(i => i.id !== id);
-  saveData();
-  render();
-}
-
-function deleteTemplate(id) {
-  if (!confirm("Delete this roster? Existing days created from it are kept.")) return;
-  state.templates = state.templates.filter(t => t.id !== id);
-  saveData();
-  render();
-}
-
-// ---------- TEMPLATE DIALOG ----------
-const templateDialog = document.getElementById("templateDialog");
-const templateForm = document.getElementById("templateForm");
-const templateNameInput = document.getElementById("templateNameInput");
-const rosterNamesInput = document.getElementById("rosterNamesInput");
-const dayInputsContainer = document.getElementById("dayInputsContainer");
-let editingTemplateId = null;
-
-function buildDayInputs(existingDays) {
-  dayInputsContainer.innerHTML = DAYS.map(day => `
-    <div class="day-block">
-      <div class="day-block-title">${day}${day === "Monday" ? " (4 sweep slots)" : " (3 sweep slots)"}</div>
-      <textarea data-day="${day}" rows="2" placeholder="One name per line">${(existingDays[day] || []).join("\n")}</textarea>
-    </div>
-  `).join("");
-}
-
-function openTemplateDialog(id) {
-  editingTemplateId = id || null;
-  if (id) {
-    const t = state.templates.find(t => t.id === id);
-    document.getElementById("templateDialogTitle").textContent = "Edit class roster";
-    templateNameInput.value = t.name;
-    rosterNamesInput.value = t.students.join("\n");
-    buildDayInputs(t.days);
-  } else {
-    document.getElementById("templateDialogTitle").textContent = "New class roster";
-    templateNameInput.value = "";
-    rosterNamesInput.value = "";
-    buildDayInputs({});
-  }
-  templateDialog.showModal();
-}
-
-document.getElementById("templateCancelBtn").onclick = () => templateDialog.close();
-
-templateForm.addEventListener("submit", () => {
-  const name = templateNameInput.value.trim();
-  const students = rosterNamesInput.value.split("\n").map(s => s.trim()).filter(Boolean);
-  if (!name) return;
-
-  const days = {};
-  dayInputsContainer.querySelectorAll("textarea[data-day]").forEach(ta => {
-    const names = ta.value.split("\n").map(s => s.trim()).filter(Boolean);
-    days[ta.dataset.day] = names;
-  });
-
-  if (editingTemplateId) {
-    const t = state.templates.find(t => t.id === editingTemplateId);
-    t.name = name;
-    t.students = students;
-    t.days = days;
-  } else {
-    state.templates.push({ id: uid(), name, students, days });
-  }
-  saveData();
-  render();
-});
-
-// ---------- INSTANTIATE DIALOG ----------
-const instantiateDialog = document.getElementById("instantiateDialog");
-const instantiateForm = document.getElementById("instantiateForm");
-const instanceDateInput = document.getElementById("instanceDateInput");
-const instanceTemplateSelect = document.getElementById("instanceTemplateSelect");
-
-function openInstantiateDialog() {
-  instanceDateInput.value = todayISO();
-  instanceTemplateSelect.innerHTML = state.templates
-    .map(t => `<option value="${t.id}">${escapeHtml(t.name)}</option>`)
-    .join("");
-  instantiateDialog.showModal();
-}
-
-document.getElementById("instantiateCancelBtn").onclick = () => instantiateDialog.close();
-
-instantiateForm.addEventListener("submit", () => {
-  const date = instanceDateInput.value;
-  const templateId = instanceTemplateSelect.value;
-  const template = state.templates.find(t => t.id === templateId);
-  if (!date || !template) return;
-
-  const weekday = weekdayNameFromISO(date);
-  if (!weekday) {
-    alert("Selected date is a Sunday — no class day. Pick Monday–Saturday.");
-    return;
+  // ----- Room Code Setup -----
+  function getSyncKey() {
+    if (!roomCode) return null;
+    return SYNC_KEY_PREFIX + roomCode;
   }
 
-  const piketNames = template.days[weekday] || [];
-  const slots = taskSlotsForDay(weekday);
-  const tasks = slots.map(slot => ({
-    id: uid(),
-    type: slot.type,
-    label: slot.label,
-    assignedName: "",
-    done: false,
-    excused: false
-  }));
-
-  const attendance = template.students.map(name => ({ id: uid(), name, status: null }));
-
-  const newInstance = {
-    id: uid(),
-    date,
-    weekday,
-    templateId,
-    piketNames,
-    tasks,
-    attendance,
-    proof: { note: "", photos: [] }
-  };
-  state.instances.push(newInstance);
-  saveData();
-  view = { screen: "instance", instanceId: newInstance.id, tab: "attendance" };
-  render();
-});
-
-// ---------- ABSENCE <-> TASK LINKAGE ----------
-// A task's assignee is excused (not required to complete it) if that person
-// has any non-null attendance status (sick/alpha/permission) for this day.
-function isNameAbsent(inst, name) {
-  if (!name) return false;
-  const rec = inst.attendance.find(a => a.name === name);
-  return !!(rec && rec.status);
-}
-
-function syncTaskExcusals(inst) {
-  inst.tasks.forEach(t => {
-    t.excused = isNameAbsent(inst, t.assignedName);
-    if (t.excused) t.done = false; // excused students aren't required to complete tasks
-  });
-}
-
-// ---------- INSTANCE DETAIL ----------
-function renderInstanceDetail(instanceId) {
-  const inst = state.instances.find(i => i.id === instanceId);
-  if (!inst) { view = { screen: "home" }; return render(); }
-
-  const tab = view.tab || "attendance";
-
-  app.innerHTML = `
-    <span class="back-link" id="backBtn">&larr; Back</span>
-    <header>
-      <h1>${formatDate(inst.date)} <span class="card-sub">(${inst.weekday})</span></h1>
-    </header>
-    <div class="tab-row">
-      <div class="tab-btn ${tab === "attendance" ? "active" : ""}" data-tab="attendance">Attendance</div>
-      <div class="tab-btn ${tab === "piket" ? "active" : ""}" data-tab="piket">Piket</div>
-      <div class="tab-btn ${tab === "proof" ? "active" : ""}" data-tab="proof">Proof</div>
-    </div>
-    <div id="tabContent"></div>
-  `;
-
-  document.getElementById("backBtn").onclick = () => { view = { screen: "home" }; render(); };
-  app.querySelectorAll(".tab-btn").forEach(btn =>
-    btn.onclick = () => { view.tab = btn.dataset.tab; render(); });
-
-  const tabContent = document.getElementById("tabContent");
-  if (tab === "attendance") {
-    renderAttendanceTab(inst, tabContent);
-  } else if (tab === "piket") {
-    renderPiketTab(inst, tabContent);
-  } else {
-    renderProofTab(inst, tabContent);
-  }
-}
-
-function renderAttendanceTab(inst, container) {
-  const sickCount = inst.attendance.filter(a => a.status === "sick").length;
-  const alphaCount = inst.attendance.filter(a => a.status === "alpha").length;
-  const permissionCount = inst.attendance.filter(a => a.status === "permission").length;
-  const totalAbsent = sickCount + alphaCount + permissionCount;
-  const parts = [];
-  if (sickCount) parts.push(`${sickCount} sick`);
-  if (alphaCount) parts.push(`${alphaCount} alpha`);
-  if (permissionCount) parts.push(`${permissionCount} permission`);
-  const summary = totalAbsent ? `${totalAbsent} absent (${parts.join(", ")})` : "0 absent";
-
-  const entriesHtml = inst.attendance.map(e => `
-    <li class="entry-item ${e.status ? "crossed" : ""}" data-id="${e.id}">
-      <span>${escapeHtml(e.name)}</span>
-      <div class="status-btns">
-        <button class="status-btn sick ${e.status === "sick" ? "active" : ""}" data-action="status" data-id="${e.id}" data-status="sick">Sick</button>
-        <button class="status-btn alpha ${e.status === "alpha" ? "active" : ""}" data-action="status" data-id="${e.id}" data-status="alpha">Alpha</button>
-        <button class="status-btn permission ${e.status === "permission" ? "active" : ""}" data-action="status" data-id="${e.id}" data-status="permission">Permission</button>
-      </div>
-    </li>
-  `).join("");
-
-  container.innerHTML = `
-    <div class="card-sub" style="margin-bottom:0.75rem;">${summary}</div>
-    <ul class="entry-list" style="list-style:none; margin:0; padding:0;">${entriesHtml}</ul>
-  `;
-
-  container.querySelectorAll('[data-action="status"]').forEach(btn =>
-    btn.onclick = () => {
-      const entry = inst.attendance.find(e => e.id === btn.dataset.id);
-      entry.status = entry.status === btn.dataset.status ? null : btn.dataset.status;
-      syncTaskExcusals(inst);
-      saveData();
-      render();
-    });
-}
-
-function renderPiketTab(inst, container) {
-  syncTaskExcusals(inst);
-
-  const nameOptions = ['<option value="">-- unassigned --</option>']
-    .concat(inst.piketNames.map(n => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`))
-    .join("");
-
-  const totalTasks = inst.tasks.length;
-  const resolvedTasks = inst.tasks.filter(t => t.done || t.excused).length;
-  const pct = totalTasks ? Math.round((resolvedTasks / totalTasks) * 100) : 0;
-
-  const grouped = { sweep: [], trash: [], mop: [] };
-  inst.tasks.forEach(t => grouped[t.type].push(t));
-
-  const taskGroupHtml = (title, tasks) => tasks.map(t => `
-    <div class="task-card ${t.done ? "done" : ""} ${t.excused ? "excused" : ""}" data-task-id="${t.id}">
-      <div class="task-top-row">
-        <div class="task-label">${title}</div>
-        <select class="task-assign-select" data-action="assign" data-task-id="${t.id}" ${t.excused ? "" : ""}>
-          ${nameOptions.replace(`value="${escapeHtml(t.assignedName)}"`, `value="${escapeHtml(t.assignedName)}" selected`)}
-        </select>
-        <button class="task-done-btn" data-action="toggle-done" data-task-id="${t.id}" aria-label="Mark done" ${t.excused ? "disabled" : ""}>${t.excused ? "—" : (t.done ? "✓" : "")}</button>
-      </div>
-      ${t.excused ? `<div class="excused-tag">Excused — ${escapeHtml(t.assignedName)} is marked absent today</div>` : ""}
-    </div>
-  `).join("");
-
-  container.innerHTML = `
-    <div class="card-sub">${resolvedTasks}/${totalTasks} tasks resolved (done or excused)</div>
-    <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
-
-    <h3>Sweep floors</h3>
-    ${taskGroupHtml("Sweep", grouped.sweep)}
-    <h3>Clean trash</h3>
-    ${taskGroupHtml("Trash", grouped.trash)}
-    <h3>Mop</h3>
-    ${taskGroupHtml("Mop", grouped.mop)}
-  `;
-
-  container.querySelectorAll('[data-action="assign"]').forEach(sel =>
-    sel.onchange = () => {
-      const task = inst.tasks.find(t => t.id === sel.dataset.taskId);
-      task.assignedName = sel.value;
-      syncTaskExcusals(inst);
-      saveData();
-      render();
-    });
-
-  container.querySelectorAll('[data-action="toggle-done"]').forEach(btn =>
-    btn.onclick = () => {
-      const task = inst.tasks.find(t => t.id === btn.dataset.taskId);
-      if (task.excused) return;
-      task.done = !task.done;
-      saveData();
-      render();
-    });
-}
-
-function renderProofTab(inst, container) {
-  const hasProof = inst.proof && (inst.proof.note || (inst.proof.photos && inst.proof.photos.length));
-  const proofPhotosHtml = (inst.proof.photos || []).map(p => `<img src="${p}" alt="proof photo" />`).join("");
-
-  container.innerHTML = `
-    <div class="proof-section" style="margin-top:0;">
-      <div class="card-title-row" style="margin-bottom:0.5rem;">
-        <h3 style="margin:0;">Proof of work</h3>
-        <button class="icon" id="editProofBtn">${hasProof ? "Edit" : "Add"}</button>
-      </div>
-      ${hasProof ? `
-        ${inst.proof.note ? `<div class="proof-note">${escapeHtml(inst.proof.note)}</div>` : ""}
-        ${inst.proof.photos && inst.proof.photos.length ? `<div class="proof-photos">${proofPhotosHtml}</div>` : ""}
-      ` : `<div class="card-sub">No proof attached yet.</div>`}
-    </div>
-  `;
-  document.getElementById("editProofBtn").onclick = () => openProofDialog(inst.id);
-}
-
-// ---------- PROOF DIALOG ----------
-const proofDialog = document.getElementById("proofDialog");
-const proofForm = document.getElementById("proofForm");
-const proofNoteInput = document.getElementById("proofNoteInput");
-const proofPhotoInput = document.getElementById("proofPhotoInput");
-const proofPhotoPreview = document.getElementById("proofPhotoPreview");
-let editingProofInstanceId = null;
-let pendingPhotos = [];
-
-function openProofDialog(instanceId) {
-  editingProofInstanceId = instanceId;
-  const inst = state.instances.find(i => i.id === instanceId);
-  proofNoteInput.value = inst.proof.note || "";
-  pendingPhotos = (inst.proof.photos || []).slice();
-  renderProofPreview();
-  proofPhotoInput.value = "";
-  proofDialog.showModal();
-}
-
-function renderProofPreview() {
-  proofPhotoPreview.innerHTML = pendingPhotos.map((src, idx) => `
-    <div class="photo-thumb-wrap">
-      <img src="${src}" alt="photo" />
-      <button type="button" class="photo-remove-btn" data-idx="${idx}">&times;</button>
-    </div>
-  `).join("");
-  proofPhotoPreview.querySelectorAll(".photo-remove-btn").forEach(btn =>
-    btn.onclick = () => {
-      pendingPhotos.splice(Number(btn.dataset.idx), 1);
-      renderProofPreview();
-    });
-}
-
-proofPhotoInput.addEventListener("change", async () => {
-  const files = Array.from(proofPhotoInput.files || []);
-  for (const file of files) {
-    const dataUrl = await fileToResizedDataUrl(file);
-    pendingPhotos.push(dataUrl);
-  }
-  proofPhotoInput.value = "";
-  renderProofPreview();
-});
-
-function fileToResizedDataUrl(file, maxDim = 1000, quality = 0.75) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = reject;
-    reader.onload = () => {
-      const img = new Image();
-      img.onerror = reject;
-      img.onload = () => {
-        let { width, height } = img;
-        if (width > maxDim || height > maxDim) {
-          const scale = maxDim / Math.max(width, height);
-          width = Math.round(width * scale);
-          height = Math.round(height * scale);
-        }
-        const canvas = document.createElement("canvas");
-        canvas.width = width;
-        canvas.height = height;
-        canvas.getContext("2d").drawImage(img, 0, 0, width, height);
-        resolve(canvas.toDataURL("image/jpeg", quality));
-      };
-      img.src = reader.result;
-    };
-    reader.readAsDataURL(file);
-  });
-}
-
-document.getElementById("proofCancelBtn").onclick = () => proofDialog.close();
-
-proofForm.addEventListener("submit", () => {
-  const inst = state.instances.find(i => i.id === editingProofInstanceId);
-  inst.proof = { note: proofNoteInput.value.trim(), photos: pendingPhotos.slice() };
-  saveData();
-  render();
-});
-
-// ---------- ANALYSIS ----------
-function renderAnalysis(templateId) {
-  const template = state.templates.find(t => t.id === templateId);
-  if (!template) { view = { screen: "home" }; return render(); }
-
-  app.innerHTML = `
-    <span class="back-link" id="backBtn">&larr; Back</span>
-    <header><h1>Analysis: ${escapeHtml(template.name)}</h1></header>
-    <div class="card" data-action="open-tally">
-      <div class="card-title">Tally</div>
-      <div class="card-sub">Attendance + piket totals per student, across all days</div>
-    </div>
-    <div class="card" data-action="open-graph">
-      <div class="card-title">Graph</div>
-      <div class="card-sub">Pick a student and see their attendance/piket breakdown</div>
-    </div>
-    <button class="icon" id="chooseBackupFolderBtn">Pilih folder backup</button>
-    <div class="card" data-action="export-zip">
-      <div class="card-title">Ekspor ZIP</div>
-      <div class="card-sub">Attendance, cleanup tasks, dan proof of work per hari</div>
-    </div>
-  `;
-  document.getElementById("backBtn").onclick = () => { view = { screen: "home" }; render(); };
-  document.getElementById("chooseBackupFolderBtn").onclick = chooseBackupFolder;
-  app.querySelector('[data-action="open-tally"]').onclick = () => { view = { screen: "tally", templateId }; render(); };
-  app.querySelector('[data-action="open-graph"]').onclick = () => { view = { screen: "graph", templateId }; render(); };
-  app.querySelector('[data-action="export-zip"]').onclick = () => exportZipForTemplate(templateId);
-}
-
-function getInstancesForTemplate(templateId) {
-  return state.instances.filter(i => i.templateId === templateId);
-}
-
-function renderTally(templateId) {
-  const template = state.templates.find(t => t.id === templateId);
-  if (!template) { view = { screen: "home" }; return render(); }
-
-  const instances = getInstancesForTemplate(templateId);
-
-  const rows = template.students.map(name => {
-    let sick = 0, alpha = 0, permission = 0, assigned = 0, completed = 0, excused = 0;
-    instances.forEach(inst => {
-      const att = inst.attendance.find(a => a.name === name);
-      if (att) {
-        if (att.status === "sick") sick++;
-        else if (att.status === "alpha") alpha++;
-        else if (att.status === "permission") permission++;
-      }
-      inst.tasks.forEach(t => {
-        if (t.assignedName === name) {
-          assigned++;
-          if (t.done) completed++;
-          if (t.excused) excused++;
-        }
-      });
-    });
-    return { name, sick, alpha, permission, assigned, completed, excused };
-  });
-
-  const rowsHtml = rows.map(r => `
-    <tr>
-      <td>${escapeHtml(r.name)}</td>
-      <td>${r.sick}</td>
-      <td>${r.alpha}</td>
-      <td>${r.permission}</td>
-      <td>${r.assigned}</td>
-      <td>${r.completed}</td>
-      <td>${r.excused}</td>
-    </tr>
-  `).join("");
-
-  app.innerHTML = `
-    <span class="back-link" id="backBtn">&larr; Back</span>
-    <header><h1>Tally: ${escapeHtml(template.name)}</h1></header>
-    <div class="card-sub" style="margin-bottom:1rem;">Across ${instances.length} day${instances.length === 1 ? "" : "s"}</div>
-    ${rows.length ? `
-    <table class="tally-table">
-      <thead><tr><th>Name</th><th>Sick</th><th>Alpha</th><th>Perm.</th><th>Tasks assigned</th><th>Tasks done</th><th>Excused</th></tr></thead>
-      <tbody>${rowsHtml}</tbody>
-    </table>` : `<div class="empty-state">No students in this roster.</div>`}
-  `;
-  document.getElementById("backBtn").onclick = () => { view = { screen: "analysis", templateId }; render(); };
-}
-
-function renderGraph(templateId) {
-  const template = state.templates.find(t => t.id === templateId);
-  if (!template) { view = { screen: "home" }; return render(); }
-
-  const instances = getInstancesForTemplate(templateId);
-  const names = template.students;
-  const selectedName = view.personName || names[0] || "";
-
-  const optionsHtml = names
-    .map(n => `<option value="${escapeHtml(n)}" ${n === selectedName ? "selected" : ""}>${escapeHtml(n)}</option>`)
-    .join("");
-
-  let sick = 0, alpha = 0, permission = 0, completed = 0, missed = 0, excused = 0;
-  instances.forEach(inst => {
-    const att = inst.attendance.find(a => a.name === selectedName);
-    if (att) {
-      if (att.status === "sick") sick++;
-      else if (att.status === "alpha") alpha++;
-      else if (att.status === "permission") permission++;
+  function setRoomCode(code) {
+    roomCode = code.trim().toUpperCase();
+    localStorage.setItem('room-code', roomCode);
+    if (gun) {
+      gun.get(getSyncKey()).off();
+      broadcastState();
     }
-    inst.tasks.forEach(t => {
-      if (t.assignedName === selectedName) {
-        if (t.excused) excused++;
-        else if (t.done) completed++;
-        else missed++;
-      }
-    });
-  });
-
-  const maxAttendance = Math.max(sick, alpha, permission, 1);
-  const maxTasks = Math.max(completed, missed, excused, 1);
-  const barHtml = (label, value, cls, max) => `
-    <div class="bar-row">
-      <div class="bar-label">${label}</div>
-      <div class="bar-track"><div class="bar-fill ${cls}" style="width:${(value / max) * 100}%"></div></div>
-      <div class="bar-value">${value}</div>
-    </div>
-  `;
-
-  app.innerHTML = `
-    <span class="back-link" id="backBtn">&larr; Back</span>
-    <header><h1>Graph: ${escapeHtml(template.name)}</h1></header>
-    <label>Student
-      <select id="personSelect">${optionsHtml}</select>
-    </label>
-    <div class="card" style="margin-top:1rem;">
-      <h3 style="margin-top:0;">Attendance</h3>
-      ${names.length ? `
-        ${barHtml("Sick", sick, "sick", maxAttendance)}
-        ${barHtml("Alpha", alpha, "alpha", maxAttendance)}
-        ${barHtml("Permission", permission, "permission", maxAttendance)}
-      ` : `<div class="empty-state">No students in this roster.</div>`}
-    </div>
-    <div class="card">
-      <h3 style="margin-top:0;">Piket tasks</h3>
-      ${names.length ? `
-        ${barHtml("Completed", completed, "", maxTasks)}
-        ${barHtml("Missed", missed, "missed", maxTasks)}
-        ${barHtml("Excused", excused, "excused", maxTasks)}
-      ` : ""}
-    </div>
-  `;
-  document.getElementById("backBtn").onclick = () => { view = { screen: "analysis", templateId }; render(); };
-  const select = document.getElementById("personSelect");
-  if (select) {
-    select.onchange = () => { view = { screen: "graph", templateId, personName: select.value }; render(); };
-  }
-}
-
-// ---------- CSV EXPORT ----------
-function csvEscape(val) {
-  const s = val == null ? "" : String(val);
-  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-  return s;
-}
-
-function rowsToCsv(rows) {
-  return rows.map(row => row.map(csvEscape).join(",")).join("\r\n");
-}
-
-function downloadCsv(filename, csvContent) {
-  const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
-
-function exportCsvForTemplate(templateId) {
-  const template = state.templates.find(t => t.id === templateId);
-  if (!template) return;
-  const instances = getInstancesForTemplate(templateId).slice().sort((a, b) => a.date.localeCompare(b.date));
-
-  // Attendance CSV: one row per student per day
-  const attendanceRows = [["Date", "Weekday", "Name", "Status"]];
-  instances.forEach(inst => {
-    inst.attendance.forEach(a => {
-      attendanceRows.push([inst.date, inst.weekday, a.name, a.status || "present"]);
-    });
-  });
-  downloadCsv(
-    `${sanitizeFilename(template.name)}_attendance.csv`,
-    rowsToCsv(attendanceRows)
-  );
-
-  // Piket/task CSV: one row per task per day
-  const taskRows = [["Date", "Weekday", "Task type", "Assigned to", "Completed", "Excused"]];
-  instances.forEach(inst => {
-    inst.tasks.forEach(t => {
-      taskRows.push([
-        inst.date,
-        inst.weekday,
-        t.label,
-        t.assignedName || "(unassigned)",
-        t.done ? "yes" : "no",
-        t.excused ? "yes" : "no"
-      ]);
-    });
-  });
-  downloadCsv(
-    `${sanitizeFilename(template.name)}_piket_tasks.csv`,
-    rowsToCsv(taskRows)
-  );
-}
-
-function sanitizeFilename(name) {
-  return name.replace(/[^a-z0-9_\-]+/gi, "_");
-}
-
-function escapeHtml(str) {
-  const div = document.createElement("div");
-  div.textContent = str == null ? "" : str;
-  return div.innerHTML;
-}
-
-render();
-
-if ("serviceWorker" in navigator) {
-  window.addEventListener("load", () => {
-    navigator.serviceWorker.register("sw.js").catch(() => {});
-  });
-}
-// ---------- ZIP EXPORT (per-day attendance + cleanup CSVs, proof photos/notes) ----------
-
-function reasonCode(status) {
-  // Map your status values to single-letter codes: Sick / Izin(permission) / Alpha
-  if (status === "sick") return "S";
-  if (status === "permission") return "I";
-  if (status === "alpha") return "A";
-  return ""; // present / no status
-}
-
-function csvEscape(val) {
-  const s = val == null ? "" : String(val);
-  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-  return s;
-}
-function rowsToCsv(rows) {
-  return rows.map(row => row.map(csvEscape).join(",")).join("\r\n");
-}
-function sanitizeFilename(name) {
-  return String(name).replace(/[^a-z0-9_\-]+/gi, "_");
-}
-
-async function exportZipForTemplate(templateId) {
-  const template = state.templates.find(t => t.id === templateId);
-  if (!template) return;
-  const instances = getInstancesForTemplate(templateId)
-    .slice()
-    .sort((a, b) => a.date.localeCompare(b.date));
-
-  if (!instances.length) {
-    alert("Tidak ada data untuk diekspor.");
-    return;
   }
 
-  const zip = new JSZip();
-  const root = zip.folder(sanitizeFilename(template.name));
+  // ----- PWA Installation -----
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    deferredPrompt = e;
+    const banner = document.getElementById('installBanner');
+    if (banner) banner.style.display = 'flex';
+  });
 
-  for (const inst of instances) {
-    const dayFolder = root.folder(inst.date); // e.g. 2026-07-30
+  window.addEventListener('appinstalled', () => {
+    const banner = document.getElementById('installBanner');
+    if (banner) banner.style.display = 'none';
+  });
 
-    // 1. Attendance CSV: Name, Reason
-    const attRows = [["Name", "Reason"]];
-    inst.attendance.forEach(a => {
-      attRows.push([a.name, reasonCode(a.status)]);
-    });
-    dayFolder.file("attendance.csv", rowsToCsv(attRows));
-
-    // 2. Class cleanup CSV: student, assigned tasks, completed?
-    // Group tasks by assignee so each student gets one row listing all their tasks.
-    const byStudent = {};
-    inst.tasks.forEach(t => {
-      const name = t.assignedName || "(unassigned)";
-      if (!byStudent[name]) byStudent[name] = [];
-      byStudent[name].push(t);
-    });
-    const cleanupRows = [["Name", "Task", "Completed", "Excused"]];
-    Object.entries(byStudent).forEach(([name, tasks]) => {
-      tasks.forEach(t => {
-        cleanupRows.push([
-          name,
-          t.label,
-          t.done ? "Yes" : "No",
-          t.excused ? "Yes" : "No"
-        ]);
+  document.addEventListener('DOMContentLoaded', () => {
+    const installBtn = document.getElementById('installBtn');
+    if (installBtn) {
+      installBtn.addEventListener('click', async () => {
+        if (deferredPrompt) {
+          deferredPrompt.prompt();
+          const result = await deferredPrompt.userChoice;
+          if (result.outcome === 'accepted') {
+            const banner = document.getElementById('installBanner');
+            if (banner) banner.style.display = 'none';
+          }
+          deferredPrompt = null;
+        }
       });
-    });
-    dayFolder.file("class_cleanup.csv", rowsToCsv(cleanupRows));
+    }
+  });
 
-    // 3. Proof of work: text note + photos folder
-    if (inst.proof) {
-      if (inst.proof.note) {
-        dayFolder.file("proof_notes.txt", inst.proof.note);
+  // ----- helpers -----
+  function loadState() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return { sublists: [] };
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed.sublists)) parsed.sublists = [];
+      return parsed;
+    } catch { return { sublists: [] }; }
+  }
+  
+  function saveState() {
+    try { 
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      if (syncEnabled) {
+        broadcastState();
       }
-      if (inst.proof.photos && inst.proof.photos.length) {
-        const photosFolder = dayFolder.folder("proof_photos");
-        inst.proof.photos.forEach((dataUrl, idx) => {
-          const base64 = dataUrl.split(",")[1];
-          if (base64) {
-            photosFolder.file(`photo_${String(idx + 1).padStart(2, "0")}.jpg`, base64, { base64: true });
+    } catch (e) { 
+      alert('Gagal menyimpan data.'); 
+    }
+  }
+
+  function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
+  function todayISO() { return new Date().toISOString().slice(0,10); }
+  function formatDate(iso) {
+    if (!iso) return 'Tanpa tanggal';
+    const d = new Date(iso + 'T00:00:00');
+    return d.toLocaleDateString('id-ID', { day:'numeric', month:'long', year:'numeric' });
+  }
+  function formatTime(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    return d.toLocaleTimeString('id-ID', { hour:'2-digit', minute:'2-digit' });
+  }
+  function formatFullDateTime(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    return d.toLocaleDateString('id-ID', { day:'numeric', month:'long', year:'numeric' }) + ' ' + 
+           d.toLocaleTimeString('id-ID', { hour:'2-digit', minute:'2-digit' });
+  }
+  function showToast(message) {
+    const existing = document.querySelector('.toast');
+    if (existing) existing.remove();
+    const toast = document.createElement('div');
+    toast.className = 'toast';
+    toast.textContent = message;
+    document.body.appendChild(toast);
+    setTimeout(() => toast.remove(), 3000);
+  }
+
+  // ----- FUZZY SEARCH -----
+  function fuzzySearch(query, text) {
+    if (!query || query.length === 0) return true;
+    const q = query.toLowerCase().trim();
+    const t = text.toLowerCase().trim();
+    
+    if (t.includes(q)) return true;
+    
+    const queryWords = q.split(/\s+/);
+    const textWords = t.split(/\s+/);
+    
+    for (const qWord of queryWords) {
+      if (qWord.length < 2) continue;
+      for (const tWord of textWords) {
+        if (tWord.startsWith(qWord)) return true;
+        if (tWord.includes(qWord)) return true;
+      }
+    }
+    
+    const allWordsMatch = queryWords.every(qWord => {
+      if (qWord.length < 2) return true;
+      return textWords.some(tWord => tWord.includes(qWord));
+    });
+    if (allWordsMatch) return true;
+    
+    let i = 0;
+    for (let j = 0; j < t.length && i < q.length; j++) {
+      if (t[j] === q[i]) i++;
+    }
+    if (i === q.length) return true;
+    
+    return false;
+  }
+
+  // ----- Helper: Check if a student matches a jurusan filter -----
+  function studentMatchesJurusan(student, filterJurusan) {
+    if (!filterJurusan) return true;
+    const studentJurusanList = student.jurusan.split('/').map(j => j.trim());
+    return studentJurusanList.includes(filterJurusan);
+  }
+
+  // ----- CSV Upload -----
+  function parseCSVText(text) {
+    const lines = text.split(/\r?\n/).filter(line => line.trim());
+    if (lines.length < 2) return false;
+    const header = lines[0].split(',').map(s => s.trim());
+    const idx = { NID: -1, Nama: -1, Kelas: -1, Jurusan: -1 };
+    header.forEach((h,i) => { 
+      const clean = h.trim();
+      if (clean === 'NID') idx.NID=i; 
+      else if (clean === 'Nama') idx.Nama=i; 
+      else if (clean === 'Kelas') idx.Kelas=i; 
+      else if (clean === 'Jurusan') idx.Jurusan=i; 
+    });
+    if (idx.NID === -1 || idx.Nama === -1 || idx.Kelas === -1 || idx.Jurusan === -1) {
+      return false;
+    }
+    const newStudents = [];
+    for (let i=1; i<lines.length; i++) {
+      const parts = lines[i].split(',').map(s => s.trim());
+      if (parts.length < 4) continue;
+      newStudents.push({
+        nid: parts[idx.NID],
+        nama: parts[idx.Nama],
+        kelas: parts[idx.Kelas],
+        jurusan: parts[idx.Jurusan]
+      });
+    }
+    if (newStudents.length === 0) return false;
+    
+    students = newStudents;
+    
+    const jurusanSet = new Set();
+    const kelasSet = new Set();
+    students.forEach(s => {
+      const parts = s.jurusan.split('/').map(j => j.trim());
+      parts.forEach(p => jurusanSet.add(p));
+      if (s.kelas) kelasSet.add(s.kelas);
+    });
+    uniqueJurusan = Array.from(jurusanSet).sort();
+    uniqueKelas = Array.from(kelasSet).sort();
+    
+    localStorage.setItem('cached-students', JSON.stringify(students));
+    localStorage.setItem('cached-jurusan', JSON.stringify(uniqueJurusan));
+    localStorage.setItem('cached-kelas', JSON.stringify(uniqueKelas));
+    
+    return true;
+  }
+
+  function loadCachedStudents() {
+    try {
+      const cached = localStorage.getItem('cached-students');
+      if (cached) {
+        students = JSON.parse(cached);
+        uniqueJurusan = JSON.parse(localStorage.getItem('cached-jurusan') || '[]');
+        uniqueKelas = JSON.parse(localStorage.getItem('cached-kelas') || '[]');
+        return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  function handleCSVUpload(file) {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const text = e.target.result;
+      if (parseCSVText(text)) {
+        showToast('✅ ' + students.length + ' siswa berhasil dimuat!');
+        render();
+      } else {
+        showToast('❌ Format CSV tidak valid. Pastikan kolom: NID,Nama,Kelas,Jurusan');
+      }
+    };
+    reader.onerror = () => showToast('❌ Gagal membaca file');
+    reader.readAsText(file);
+  }
+
+  // ----- Gun.js Sync with Room Code -----
+  function initGun() {
+    try {
+      deviceId = localStorage.getItem('device-id') || 'device-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      localStorage.setItem('device-id', deviceId);
+
+      gun = Gun(['https://gun-manhattan.herokuapp.com/gun']);
+      syncEnabled = true;
+      console.log('✅ Gun.js initialized with device ID:', deviceId);
+
+      const savedRoom = localStorage.getItem('room-code');
+      if (savedRoom) {
+        roomCode = savedRoom;
+        setupSyncListener();
+      }
+
+      return true;
+    } catch (e) {
+      console.warn('⚠️ Gun.js initialization failed:', e);
+      syncEnabled = false;
+      return false;
+    }
+  }
+
+  function setupSyncListener() {
+    const key = getSyncKey();
+    if (!key || !gun) return;
+    
+    gun.get(key).off();
+    
+    gun.get(key).on((data, key) => {
+      if (data && data.sublists && data._deviceId !== deviceId) {
+        console.log('📡 Remote data received from:', data._deviceId, 'room:', roomCode);
+        mergeRemoteData(data);
+      }
+    });
+    
+    broadcastState();
+  }
+
+  function broadcastState() {
+    if (!syncEnabled || !gun || !roomCode) return;
+    const key = getSyncKey();
+    if (!key) return;
+    
+    const data = JSON.parse(JSON.stringify(state));
+    data._deviceId = deviceId;
+    data._timestamp = Date.now();
+    data._room = roomCode;
+    gun.get(key).put(data);
+  }
+
+  function mergeRemoteData(remoteData) {
+    if (!remoteData || !remoteData.sublists || isSyncing) return;
+    isSyncing = true;
+    
+    let changed = false;
+    
+    remoteData.sublists.forEach(remoteSub => {
+      const localSub = state.sublists.find(s => s.id === remoteSub.id);
+      if (!localSub) {
+        state.sublists.push(JSON.parse(JSON.stringify(remoteSub)));
+        changed = true;
+      } else {
+        remoteSub.entries.forEach(remoteEntry => {
+          const localEntry = localSub.entries.find(e => e.id === remoteEntry.id);
+          if (!localEntry) {
+            localSub.entries.push(JSON.parse(JSON.stringify(remoteEntry)));
+            changed = true;
           }
         });
       }
+    });
+
+    if (changed) {
+      saveState();
+      render();
+      showToast('🔄 Data tersinkron dari perangkat lain!');
+    }
+    
+    isSyncing = false;
+  }
+
+  // ----- Room Code Dialog -----
+  function showRoomDialog() {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal">
+        <h2>🔑 Kode Ruangan</h2>
+        <p style="color:#6b7d92; margin-bottom:0.5rem;">Masukkan kode yang sama di semua perangkat untuk sinkronisasi.</p>
+        <label>
+          Kode Ruangan
+          <input type="text" id="roomCodeInput" placeholder="Contoh: KELAS10A" value="${roomCode}" maxlength="20" style="text-transform:uppercase;" />
+        </label>
+        <div style="margin-top:0.5rem; display:flex; gap:8px; justify-content:flex-end;">
+          <button class="btn" id="roomCancelBtn">Batal</button>
+          <button class="primary" id="roomSaveBtn">Simpan</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    const input = document.getElementById('roomCodeInput');
+    document.getElementById('roomCancelBtn').onclick = () => overlay.remove();
+    document.getElementById('roomSaveBtn').onclick = () => {
+      const code = input.value.trim().toUpperCase();
+      if (code) {
+        setRoomCode(code);
+        setupSyncListener();
+        showToast('✅ Kode ruangan: ' + code);
+        overlay.remove();
+        render();
+      } else {
+        showToast('❌ Masukkan kode ruangan');
+      }
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') document.getElementById('roomSaveBtn').click();
+    });
+    setTimeout(() => input.focus(), 100);
+  }
+
+  // ----- load students from CSV or cache -----
+  async function loadStudents() {
+    if (loadCachedStudents()) {
+      console.log('📊 Loaded ' + students.length + ' students from cache');
+      return true;
+    }
+    
+    try {
+      const resp = await fetch('students.csv');
+      if (!resp.ok) throw new Error('file not found');
+      const text = await resp.text();
+      if (parseCSVText(text)) {
+        console.log('✅ Loaded ' + students.length + ' students from students.csv');
+        return true;
+      }
+    } catch (e) {
+      console.warn('⚠️ students.csv tidak ditemukan');
+    }
+    
+    const defaultData = `NID,Nama,Kelas,Jurusan
+2627.10.001,Abdul Jabbar Ibnu Malik,10,TKJ
+2627.10.041,Abimanyu Wiguna,10,RPL
+2627.10.124,Abelia Septiani Putri,10,DKV
+2627.10.162,Agni Farren Sabiya,10,KKR
+2526.10.036,Abdurrahman,11,RPL
+2526.10.001,Alanis Sabrina Suharman,11,TKJ/DKV
+2526.10.072,Alifia Chalista,11,KKR
+2425.10.035,Abib Brenatanta Tarigan,12,RPL
+2425.10.001,Abdul Patah,12,TKJ/PSPT
+2425.10.074,Aida Hidayanti Lestari,12,DKV
+2425.10.110,Alfira Rahmawati,12,KKR`;
+    parseCSVText(defaultData);
+    console.log('📊 Using default data with ' + students.length + ' students');
+    return true;
+  }
+
+  // ----- render engine -----
+  const app = document.getElementById('app');
+
+  function render() {
+    if (view.screen === 'sublist' && view.sublistId) {
+      renderSublistDetail(view.sublistId);
+    } else if (view.screen === 'analysis') {
+      renderAnalysis();
+    } else if (view.screen === 'studentDetail' && view.studentNid) {
+      renderStudentDetail(view.studentNid);
+    } else {
+      renderHome();
+    }
+    const existingModal = document.querySelector('.modal-overlay');
+    if (existingModal) existingModal.remove();
+    if (view.showModal) {
+      renderModal();
     }
   }
 
-  const blob = await zip.generateAsync({ type: "blob" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `${sanitizeFilename(template.name)}_export_${todayISO()}.zip`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
+  // ----- HOME: daftar sublist -----
+  function renderHome() {
+    const sublists = state.sublists.slice().sort((a,b) => b.createdAt.localeCompare(a.createdAt));
+    let listHtml = sublists.length === 0 ? `<div class="empty">Belum ada daftar. Buat baru di bawah.</div>` :
+      sublists.map(s => {
+        const count = (s.entries || []).length;
+        return `<div class="card" style="cursor:pointer;" data-id="${s.id}">
+          <div class="card-header">
+            <span class="card-title">${formatDate(s.date)}</span>
+            <span class="card-sub">${count} siswa</span>
+          </div>
+          <div class="flex">
+            <span class="tag">${s.createdAt ? formatTime(s.createdAt) : ''}</span>
+            <button class="danger" style="margin-left:auto; padding:0.3rem 0.8rem; font-size:0.75rem;" data-action="delete-sublist" data-id="${s.id}">Hapus</button>
+          </div>
+        </div>`;
+      }).join('');
 
-// ---------- FILESYSTEM BACKUP (File System Access API) ----------
+    const syncStatus = syncEnabled && roomCode ? 
+      `<span class="sync-status online"><span class="sync-dot online"></span> ${roomCode}</span>` :
+      `<span class="sync-status offline"><span class="sync-dot offline"></span> Offline</span>`;
 
-let backupDirHandle = null; // persists only for the session unless you store the handle via IndexedDB
+    const studentCount = students.length > 0 ? `${students.length} siswa` : 'Belum ada data siswa';
 
-async function chooseBackupFolder() {
-  if (!("showDirectoryPicker" in window)) {
-    alert("Fitur ini tidak didukung di browser ini. Gunakan Chrome/Edge di desktop atau Android.");
-    return;
-  }
-  try {
-    backupDirHandle = await window.showDirectoryPicker();
-    await idbSaveHandle(backupDirHandle);
-    alert("Folder backup dipilih. Backup akan disimpan di sini secara berkala.");
-  } catch (e) {
-    // user cancelled
-  }
-}
+    app.innerHTML = `
+      <header>
+        <h1>⏰ Pencatatan Terlambat</h1>
+        <button class="primary" id="newSublistBtn">+ Daftar Baru</button>
+      </header>
+      <div style="margin-bottom:1rem; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+        <button class="btn" id="analysisBtn">📊 Analisis</button>
+        <button class="btn warning" id="roomBtn" style="font-size:0.7rem; padding:0.3rem 0.8rem;">🔑 ${roomCode || 'Setel Kode'}</button>
+        <span style="font-size:0.8rem; color:#6b7d92; align-self:center;">${studentCount}</span>
+        ${syncStatus}
+      </div>
+      
+      <div class="card" style="padding:0.8rem;">
+        <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+          <span style="font-size:0.8rem; color:#6b7d92;">📂 Upload data siswa:</span>
+          <div class="file-input-wrapper">
+            <button class="btn" style="font-size:0.8rem; padding:0.3rem 0.8rem;">Pilih CSV</button>
+            <input type="file" id="csvUploadInput" accept=".csv" />
+          </div>
+          <span style="font-size:0.7rem; color:#6b7d92;">(CSV: NID,Nama,Kelas,Jurusan)</span>
+        </div>
+      </div>
+      
+      ${listHtml}
+      <div style="margin-top:1rem; font-size:0.8rem; color:#6b7d92; text-align:center;">Total daftar: ${sublists.length}</div>
+    `;
 
-async function writeBackupNow() {
-  if (!backupDirHandle) return;
-  try {
-    // verify/re-request permission (required after reload)
-    const perm = await backupDirHandle.requestPermission({ mode: "readwrite" });
-    if (perm !== "granted") return;
-
-    const fileHandle = await backupDirHandle.getFileHandle(
-      `class-tracker-backup-${todayISO()}.json`,
-      { create: true }
-    );
-    const writable = await fileHandle.createWritable();
-    await writable.write(JSON.stringify(state, null, 2));
-    await writable.close();
-    console.log("Backup written", new Date().toISOString());
-  } catch (e) {
-    console.error("Backup failed", e);
-  }
-}
-
-// Persist the directory handle across reloads using IndexedDB (handles aren't localStorage-serializable)
-function idbSaveHandle(handle) {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open("class-tracker-fs", 1);
-    req.onupgradeneeded = () => req.result.createObjectStore("handles");
-    req.onsuccess = () => {
-      const tx = req.result.transaction("handles", "readwrite");
-      tx.objectStore("handles").put(handle, "backupDir");
-      tx.oncomplete = resolve;
-      tx.onerror = reject;
+    document.getElementById('newSublistBtn').onclick = () => {
+      if (students.length === 0) {
+        showToast('⚠️ Upload data siswa terlebih dahulu!');
+        return;
+      }
+      const newSub = { id: uid(), date: todayISO(), createdAt: new Date().toISOString(), entries: [] };
+      state.sublists.push(newSub);
+      saveState();
+      render();
     };
-    req.onerror = reject;
-  });
-}
+    document.getElementById('analysisBtn').onclick = () => { view.screen = 'analysis'; render(); };
+    document.getElementById('roomBtn').onclick = showRoomDialog;
 
-function idbLoadHandle() {
-  return new Promise((resolve) => {
-    const req = indexedDB.open("class-tracker-fs", 1);
-    req.onupgradeneeded = () => req.result.createObjectStore("handles");
-    req.onsuccess = () => {
-      const tx = req.result.transaction("handles", "readonly");
-      const getReq = tx.objectStore("handles").get("backupDir");
-      getReq.onsuccess = () => resolve(getReq.result || null);
-      getReq.onerror = () => resolve(null);
+    document.getElementById('csvUploadInput').onchange = (e) => {
+      const file = e.target.files[0];
+      if (file) {
+        handleCSVUpload(file);
+      }
+      e.target.value = '';
     };
-    req.onerror = () => resolve(null);
-  });
-}
 
-// On load: try to restore the saved folder handle and back up every 5 minutes + on save
-(async () => {
-  backupDirHandle = await idbLoadHandle();
-  if (backupDirHandle) {
-    setInterval(writeBackupNow, 5 * 60 * 1000);
+    app.querySelectorAll('[data-action="delete-sublist"]').forEach(btn => {
+      btn.onclick = (e) => { e.stopPropagation(); if (confirm('Hapus daftar ini?')) { state.sublists = state.sublists.filter(s => s.id !== btn.dataset.id); saveState(); render(); } };
+    });
+    app.querySelectorAll('.card[data-id]').forEach(card => {
+      card.onclick = () => { view.screen = 'sublist'; view.sublistId = card.dataset.id; render(); };
+    });
   }
+
+  // ----- SUBLIST DETAIL -----
+  function renderSublistDetail(id) {
+    const sub = state.sublists.find(s => s.id === id);
+    if (!sub) { view.screen = 'home'; render(); return; }
+    const entries = sub.entries || [];
+    const sorted = entries.slice().sort((a,b) => a.timestamp.localeCompare(b.timestamp));
+
+    let entriesHtml = sorted.length === 0 ? `<div class="empty">Belum ada siswa tercatat terlambat.</div>` :
+      sorted.map(e => {
+        const student = students.find(s => s.nid === e.nid);
+        const nama = student ? student.nama : e.nid;
+        const kelas = student ? student.kelas : '-';
+        const jurusan = student ? student.jurusan : '-';
+        const reason = e.reason || '';
+        return `<div class="list-item">
+          <div>
+            <strong>${nama}</strong> 
+            <span class="tag">${kelas} ${jurusan}</span>
+            ${reason ? `<span class="reason-tag" title="${reason}">💬 ${reason}</span>` : ''}
+          </div>
+          <div class="flex">
+            <span class="time-tag">${formatTime(e.timestamp)}</span>
+            <button class="danger" style="padding:0.1rem 0.6rem; font-size:0.7rem;" data-action="delete-entry" data-entryid="${e.id}">✕</button>
+          </div>
+        </div>`;
+      }).join('');
+
+    app.innerHTML = `
+      <header>
+        <div><button class="btn" id="backHomeBtn">← Kembali</button></div>
+        <button class="primary" id="addLateBtn">+ Catat Terlambat</button>
+      </header>
+      <div class="card">
+        <div class="card-header"><span class="card-title">${formatDate(sub.date)}</span>
+          <span class="card-sub">${sorted.length} siswa</span>
+        </div>
+        <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:0.3rem;">
+          <button class="btn" id="exportCsvBtn">📥 Export CSV</button>
+          <button class="btn success" id="exportTextBtn">📋 Export Text</button>
+        </div>
+        ${entriesHtml}
+      </div>
+    `;
+
+    document.getElementById('backHomeBtn').onclick = () => { view.screen = 'home'; render(); };
+    document.getElementById('addLateBtn').onclick = () => { 
+      if (students.length === 0) {
+        showToast('⚠️ Upload data siswa terlebih dahulu!');
+        return;
+      }
+      view.showModal = true; 
+      modalState = { jurusan: '', kelas: '', filter: '', selectedStudent: null };
+      render(); 
+    };
+    document.getElementById('exportCsvBtn').onclick = () => exportSublistCSV(sub);
+    document.getElementById('exportTextBtn').onclick = () => exportSublistText(sub);
+
+    app.querySelectorAll('[data-action="delete-entry"]').forEach(btn => {
+      btn.onclick = (e) => { e.stopPropagation(); if (confirm('Hapus catatan ini?')) { sub.entries = sub.entries.filter(ent => ent.id !== btn.dataset.entryid); saveState(); render(); } };
+    });
+  }
+
+  // ----- MODAL: pilih jurusan + kelas, daftar nama, dan alasan -----
+  function renderModal() {
+    const individualJurusans = uniqueJurusan;
+    let filtered = students;
+    if (modalState.jurusan) filtered = filtered.filter(s => studentMatchesJurusan(s, modalState.jurusan));
+    if (modalState.kelas) filtered = filtered.filter(s => s.kelas === modalState.kelas);
+    if (modalState.filter) filtered = filtered.filter(s => fuzzySearch(modalState.filter, s.nama));
+
+    const nameBtns = filtered.map(s => `<div class="name-btn" data-nid="${s.nid}" data-nama="${s.nama}" data-kelas="${s.kelas}" data-jurusan="${s.jurusan}">${s.nama}</div>`).join('');
+
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal">
+        <h2>📌 Catat Terlambat</h2>
+        <div class="filter-row">
+          <select id="modalJurusanSelect">
+            <option value="">Semua Jurusan</option>
+            ${individualJurusans.map(j => `<option value="${j}" ${j===modalState.jurusan?'selected':''}>${j}</option>`).join('')}
+          </select>
+          <select id="modalKelasSelect">
+            <option value="">Semua Kelas</option>
+            ${uniqueKelas.map(k => `<option value="${k}" ${k===modalState.kelas?'selected':''}>${k}</option>`).join('')}
+          </select>
+        </div>
+        <input class="search-box" id="modalFilterInput" placeholder="Cari nama (fuzzy)..." value="${modalState.filter}" autofocus />
+        <div class="student-count">${filtered.length} dari ${students.length} siswa</div>
+        <div class="name-grid" id="nameGrid">${nameBtns || '<div class="empty" style="grid-column:1/-1;">Tidak ada siswa</div>'}</div>
+        
+        <div style="margin-top:0.8rem;">
+          <label style="font-size:0.85rem; font-weight:500; color:#2c3e55;">Alasan (opsional)</label>
+          <textarea id="modalReasonInput" placeholder="Mis: Macet, bangun kesiangan, dll..." rows="2" style="width:100%; padding:0.7rem 0.8rem; border:1px solid #d0d8e0; border-radius:16px; font-size:1rem; background:#f8faff; font-family:inherit; resize:vertical; min-height:50px;"></textarea>
+        </div>
+        
+        <div style="margin-top:0.8rem; display:flex; gap:8px; justify-content:flex-end;">
+          <button class="btn" id="modalCloseBtn">Batal</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    document.getElementById('modalCloseBtn').onclick = () => { view.showModal = false; render(); };
+    
+    const jurusanSelect = document.getElementById('modalJurusanSelect');
+    const kelasSelect = document.getElementById('modalKelasSelect');
+    const filterInput = document.getElementById('modalFilterInput');
+    const reasonInput = document.getElementById('modalReasonInput');
+    
+    jurusanSelect.onchange = (e) => { 
+      modalState.jurusan = e.target.value; 
+      updateModalContent();
+    };
+    kelasSelect.onchange = (e) => { 
+      modalState.kelas = e.target.value; 
+      updateModalContent();
+    };
+    filterInput.oninput = (e) => { 
+      modalState.filter = e.target.value; 
+      updateModalContent();
+    };
+
+    setTimeout(() => filterInput.focus(), 50);
+
+    attachNameButtonHandlers(reasonInput);
+
+    function updateModalContent() {
+      let filtered2 = students;
+      if (modalState.jurusan) filtered2 = filtered2.filter(s => studentMatchesJurusan(s, modalState.jurusan));
+      if (modalState.kelas) filtered2 = filtered2.filter(s => s.kelas === modalState.kelas);
+      if (modalState.filter) filtered2 = filtered2.filter(s => fuzzySearch(modalState.filter, s.nama));
+
+      const grid = document.getElementById('nameGrid');
+      const countDisplay = document.querySelector('.student-count');
+      if (!grid) return;
+      
+      if (countDisplay) {
+        countDisplay.textContent = `${filtered2.length} dari ${students.length} siswa`;
+      }
+      
+      if (filtered2.length === 0) {
+        grid.innerHTML = '<div class="empty" style="grid-column:1/-1;">Tidak ada siswa</div>';
+        return;
+      }
+      
+      grid.innerHTML = filtered2.map(s => 
+        `<div class="name-btn" data-nid="${s.nid}" data-nama="${s.nama}" data-kelas="${s.kelas}" data-jurusan="${s.jurusan}">${s.nama}</div>`
+      ).join('');
+      
+      const currentReason = document.getElementById('modalReasonInput');
+      attachNameButtonHandlers(currentReason);
+    }
+
+    function attachNameButtonHandlers(reasonField) {
+      document.querySelectorAll('.name-btn').forEach(btn => {
+        btn.onclick = () => {
+          const nid = btn.dataset.nid;
+          const sub = state.sublists.find(s => s.id === view.sublistId);
+          if (!sub) return;
+          
+          const reason = reasonField ? reasonField.value.trim() : '';
+          
+          const existingIndex = sub.entries.findIndex(entry => entry.nid === nid);
+          
+          if (existingIndex !== -1) {
+            sub.entries[existingIndex] = {
+              ...sub.entries[existingIndex],
+              timestamp: new Date().toISOString(),
+              reason: reason || ''
+            };
+            showToast('✅ Data siswa diperbarui!');
+          } else {
+            sub.entries.push({ 
+              id: uid(), 
+              nid, 
+              timestamp: new Date().toISOString(),
+              reason: reason || '' 
+            });
+            showToast('✅ Siswa berhasil dicatat!');
+          }
+          
+          saveState();
+          view.showModal = false;
+          render();
+        };
+      });
+    }
+  }
+
+  // ----- EXPORT CSV -----
+  function exportSublistCSV(sub) {
+    const entries = sub.entries || [];
+    const rows = [['NID', 'Nama', 'Kelas', 'Jurusan', 'Waktu Kedatangan', 'Alasan']];
+    entries.forEach(e => {
+      const s = students.find(st => st.nid === e.nid);
+      const nama = s ? s.nama : e.nid;
+      const kelas = s ? s.kelas : '-';
+      const jurusan = s ? s.jurusan : '-';
+      rows.push([e.nid, nama, kelas, jurusan, formatFullDateTime(e.timestamp), e.reason || '']);
+    });
+    const csv = rows.map(row => row.join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `terlambat_${sub.date}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showToast('✅ CSV berhasil diexport!');
+  }
+
+  // ----- EXPORT TEXT (copy to clipboard) -----
+  function exportSublistText(sub) {
+    const entries = sub.entries || [];
+    if (entries.length === 0) {
+      showToast('⚠️ Tidak ada data untuk diexport');
+      return;
+    }
+
+    const sorted = entries.slice().sort((a,b) => a.timestamp.localeCompare(b.timestamp));
+    
+    let text = `📋 DAFTAR SISWA TERLAMBAT\n`;
+    text += `📅 Tanggal: ${formatDate(sub.date)}\n`;
+    text += `👥 Total: ${sorted.length} siswa\n\n`;
+    
+    sorted.forEach((e, index) => {
+      const s = students.find(st => st.nid === e.nid);
+      const nama = s ? s.nama : e.nid;
+      const kelas = s ? s.kelas : '-';
+      const jurusan = s ? s.jurusan : '-';
+      const waktu = formatFullDateTime(e.timestamp);
+      const reason = e.reason || '-';
+      
+      text += `${index + 1}. ${nama} (${kelas} ${jurusan}) - ${waktu}`;
+      if (reason !== '-') text += ` - Alasan: ${reason}`;
+      text += `\n`;
+    });
+
+    navigator.clipboard.writeText(text).then(() => {
+      showToast('✅ Teks berhasil disalin ke clipboard!');
+    }).catch(() => {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      showToast('✅ Teks berhasil disalin ke clipboard!');
+    });
+  }
+
+  // ----- STUDENT DETAIL -----
+  function renderStudentDetail(nid) {
+    const student = students.find(s => s.nid === nid);
+    if (!student) { view.screen = 'analysis'; render(); return; }
+
+    const allEntries = [];
+    state.sublists.forEach(sub => {
+      (sub.entries || []).forEach(e => {
+        if (e.nid === nid) {
+          allEntries.push({ ...e, subDate: sub.date });
+        }
+      });
+    });
+
+    const sorted = allEntries.sort((a,b) => b.timestamp.localeCompare(a.timestamp));
+    const total = sorted.length;
+
+    let entriesHtml = sorted.length === 0 ? 
+      `<div class="empty">Belum ada catatan keterlambatan untuk siswa ini.</div>` :
+      sorted.map(e => {
+        const date = formatDate(e.subDate);
+        const waktu = formatFullDateTime(e.timestamp);
+        const reason = e.reason || 'Tidak ada alasan';
+        return `<div class="detail-item">
+          <div style="display:flex; justify-content:space-between; flex-wrap:wrap; gap:4px;">
+            <span><strong>${date}</strong></span>
+            <span class="time-tag">${waktu}</span>
+          </div>
+          <div class="detail-reason">💬 ${reason}</div>
+        </div>`;
+      }).join('');
+
+    app.innerHTML = `
+      <header>
+        <button class="btn" id="backFromStudentDetail">← Kembali</button>
+        <h1 style="font-size:1.2rem;">${student.nama}</h1>
+      </header>
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">📋 Riwayat Keterlambatan</span>
+          <span class="card-sub">${total} kali</span>
+        </div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:0.5rem;">
+          <span class="tag">${student.kelas}</span>
+          <span class="tag">${student.jurusan}</span>
+          <span class="tag">NID: ${student.nid}</span>
+        </div>
+        ${entriesHtml}
+      </div>
+    `;
+
+    document.getElementById('backFromStudentDetail').onclick = () => { 
+      view.screen = 'analysis'; 
+      render(); 
+    };
+  }
+
+  // ----- ANALYSIS -----
+  function renderAnalysis() {
+    const allEntries = [];
+    state.sublists.forEach(sub => {
+      (sub.entries || []).forEach(e => {
+        allEntries.push({ ...e, subDate: sub.date });
+      });
+    });
+
+    const map = new Map();
+    allEntries.forEach(e => {
+      const s = students.find(st => st.nid === e.nid);
+      const nama = s ? s.nama : e.nid;
+      const key = e.nid;
+      if (!map.has(key)) map.set(key, { nid: e.nid, nama, count: 0, details: [] });
+      const rec = map.get(key);
+      rec.count += 1;
+      rec.details.push({ tanggal: e.subDate, waktu: e.timestamp, reason: e.reason || '' });
+    });
+
+    const sorted = Array.from(map.values()).sort((a,b) => b.count - a.count);
+    const total = allEntries.length;
+    const unique = sorted.length;
+
+    let topHtml = sorted.slice(0,5).map((item, idx) => {
+      const emoji = idx === 0 ? '🥇' : idx === 1 ? '🥈' : idx === 2 ? '🥉' : `${idx+1}.`;
+      return `<div class="list-item" style="cursor:pointer;" data-nid="${item.nid}">
+        <span>${emoji} ${item.nama}</span> 
+        <span class="tag">${item.count} kali</span>
+      </div>`;
+    }).join('');
+
+    app.innerHTML = `
+      <header>
+        <button class="btn" id="backHomeFromAnalysis">← Kembali</button>
+        <h1 style="font-size:1.2rem;">📊 Analisis</h1>
+      </header>
+      <div class="card">
+        <div class="stats-grid">
+          <div class="stat-card"><div class="stat-number">${total}</div><div class="stat-label">Total keterlambatan</div></div>
+          <div class="stat-card"><div class="stat-number">${unique}</div><div class="stat-label">Siswa unik</div></div>
+        </div>
+        <div style="font-size:0.8rem; color:#4a5b6e;">Rata-rata: ${unique ? (total/unique).toFixed(1) : 0} per siswa</div>
+      </div>
+      <div class="card">
+        <div class="card-header"><span class="card-title">🏆 Paling sering terlambat</span></div>
+        ${topHtml || '<div class="empty">Belum ada data</div>'}
+      </div>
+      <div class="card" style="max-height:200px; overflow-y:auto;">
+        <div class="card-header"><span class="card-title">Semua siswa</span></div>
+        ${sorted.map(item => `<div class="list-item" style="cursor:pointer;" data-nid="${item.nid}">
+          <span>${item.nama}</span>
+          <span class="tag">${item.count} kali</span>
+        </div>`).join('') || '<div class="empty">Tidak ada</div>'}
+      </div>
+      <div style="font-size:0.7rem; color:#6b7d92; text-align:center; margin-top:0.5rem;">👆 Klik nama siswa untuk melihat alasan keterlambatan</div>
+    `;
+
+    document.getElementById('backHomeFromAnalysis').onclick = () => { view.screen = 'home'; render(); };
+
+    app.querySelectorAll('.list-item[data-nid]').forEach(item => {
+      item.onclick = () => {
+        view.screen = 'studentDetail';
+        view.studentNid = item.dataset.nid;
+        render();
+      };
+    });
+  }
+
+  // ----- init -----
+  async function init() {
+    await loadStudents();
+    console.log('✅ Students loaded:', students.length);
+    initGun();
+    render();
+  }
+
+  // service worker (PWA)
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('sw.js')
+        .then(reg => console.log('✅ Service Worker registered'))
+        .catch(err => console.log('❌ Service Worker registration failed:', err));
+    });
+  }
+
+  init();
 })();
